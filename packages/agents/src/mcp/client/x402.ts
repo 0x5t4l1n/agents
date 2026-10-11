@@ -441,6 +441,49 @@ class PaymentCapError extends Error {}
 // returns the server's original 402 result, as before the hook existed.
 class PaymentPassthroughError extends Error {}
 
+/**
+ * Extract a PaymentRequired object from a tool-call error response.
+ *
+ * The x402 v2 MCP transport spec says servers MUST return the
+ * PaymentRequired object in `structuredContent` (preferred) and as JSON in
+ * `content[0].text`.  The legacy agents-specific convention puts it in
+ * `_meta["x402/error"]`.  We check all three locations so that both
+ * spec-compliant servers (e.g. the reference @x402/mcp wrapper) and
+ * existing withX402-based servers work.
+ */
+function extractPaymentRequired(
+  res: CallToolResult
+): (PaymentRequired & Record<string, unknown>) | undefined {
+  if (!res.isError) return undefined;
+  const isValid = (
+    v: unknown
+  ): v is PaymentRequired & Record<string, unknown> =>
+    !!v &&
+    typeof v === "object" &&
+    typeof (v as PaymentRequired).x402Version === "number" &&
+    Array.isArray((v as PaymentRequired).accepts) &&
+    (v as PaymentRequired).accepts.length > 0;
+
+  // x402 v2 spec: structuredContent (preferred)
+  if (isValid((res as Record<string, unknown>).structuredContent)) {
+    return (res as Record<string, unknown>).structuredContent as PaymentRequired &
+      Record<string, unknown>;
+  }
+  // x402 v2 spec fallback: content[0].text as JSON
+  const first = res.content?.[0];
+  if (first && first.type === "text") {
+    try {
+      const parsed = JSON.parse(first.text);
+      if (isValid(parsed)) return parsed;
+    } catch {
+      // not valid JSON, fall through
+    }
+  }
+  // Legacy: _meta["x402/error"] (agents-specific, backward compat)
+  const legacy = res._meta?.["x402/error"];
+  return isValid(legacy) ? (legacy as PaymentRequired & Record<string, unknown>) : undefined;
+}
+
 export function withX402Client<T extends CompatibleMcpClient>(
   client: T,
   x402Config: X402ClientConfig
@@ -528,18 +571,11 @@ export function withX402Client<T extends CompatibleMcpClient>(
       invoker.callTool(callParams, schemaOrOptions, options);
     const res = await invoke(params);
 
-    // Check for x402 payment required error in response metadata
-    const maybeX402Error = res._meta?.["x402/error"] as
-      | (PaymentRequired & Record<string, unknown>)
-      | undefined;
+    // Detect x402 payment-required: structuredContent (spec v2), then
+    // content[0].text (spec v2 fallback), then _meta["x402/error"] (legacy).
+    const maybeX402Error = extractPaymentRequired(res);
 
-    if (
-      res.isError &&
-      maybeX402Error &&
-      maybeX402Error.accepts &&
-      Array.isArray(maybeX402Error.accepts) &&
-      maybeX402Error.accepts.length > 0
-    ) {
+    if (maybeX402Error) {
       // Snapshot the requirements: what is cap-checked and signed below is
       // this copy, not the server's result object or anything aliasing it.
       const accepts = structuredClone(
