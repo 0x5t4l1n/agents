@@ -70,10 +70,9 @@ function fsError(path: string, cause?: unknown): Error & { code: string } {
   ) {
     return cause as Error & { code: string };
   }
-  const err = new Error(
-    cause instanceof Error ? cause.message : `ENOENT: ${path}`
-  ) as Error & { code: string };
-  err.code = "ENOENT";
+  const message = cause instanceof Error ? cause.message : `ENOENT: ${path}`;
+  const err = new Error(message) as Error & { code: string };
+  err.code = /^(E[A-Z]+):/.exec(message)?.[1] ?? "ENOENT";
   return err;
 }
 
@@ -135,7 +134,11 @@ export function createGitFs(fs: FileSystem) {
         mode?: number | { recursive?: boolean }
       ): Promise<void> {
         const recursive = typeof mode === "object" ? mode.recursive : false;
-        await fs.mkdir(path, { recursive });
+        try {
+          await fs.mkdir(path, { recursive });
+        } catch (err) {
+          throw fsError(path, err);
+        }
       },
 
       async rmdir(path: string): Promise<void> {
